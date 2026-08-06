@@ -16,7 +16,7 @@ app = FastAPI(
 )
 
 # Initialize Engine Instances
-ocr_engine = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+ocr_engine = PaddleOCR(use_angle_cls=True, lang='en')
 gemini_client = genai.Client()
 
 # ===================================================================
