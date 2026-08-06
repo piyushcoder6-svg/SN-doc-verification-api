@@ -24,11 +24,11 @@ OCR_SPACE_URL = "https://api.ocr.space/parse/image"
 class AIReviewRequest(BaseModel):
     case_sys_id: Optional[str] = Field(None, description="Sys ID of x_snc_flow4now_b_0_application_case record")
     document_type: str = Field(..., description="e.g., Aadhaar, PAN, Passport")
-    ocr_text: str = Field(..., description="Extracted OCR text string")
-    customer_name: str
-    dob: str
-    gender: str
-    address: str
+    ocr_text: Optional[str] = Field("", description="Extracted OCR text string")
+    customer_name: Optional[str] = Field("", description="Customer Name")
+    dob: Optional[str] = Field("", description="Date of Birth")
+    gender: Optional[str] = Field("", description="Gender")
+    address: Optional[str] = Field("", description="Address")
 
 class RiskAssessmentRequest(BaseModel):
     case_sys_id: Optional[str] = Field(None, description="Sys ID of x_snc_flow4now_b_0_application_case record")
