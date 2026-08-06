@@ -1,7 +1,7 @@
 import os
 import httpx
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, Query, Header
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -22,7 +22,7 @@ OCR_SPACE_URL = "https://api.ocr.space/parse/image"
 # ===================================================================
 
 class AIReviewRequest(BaseModel):
-    case_sys_id: Optional[str] = Field(None, description="Sys ID of u_application_case record")
+    case_sys_id: Optional[str] = Field(None, description="Sys ID of x_snc_flow4now_b_0_application_case record")
     document_type: str = Field(..., description="e.g., Aadhaar, PAN, Passport")
     ocr_text: str = Field(..., description="Extracted OCR text string")
     customer_name: str
@@ -31,31 +31,42 @@ class AIReviewRequest(BaseModel):
     address: str
 
 class RiskAssessmentRequest(BaseModel):
-    case_sys_id: Optional[str] = Field(None, description="Sys ID of u_application_case record")
-    annual_income: str = Field(..., description="Mapped from u_application_case.annual_income")
+    case_sys_id: Optional[str] = Field(None, description="Sys ID of x_snc_flow4now_b_0_application_case record")
+    annual_income: str = Field(..., description="Mapped from annual_income")
     occupation: str
-    account_type: str = Field(..., description="Mapped from u_application_case.account_type")
+    account_type: str = Field(..., description="Mapped from account_type")
     country: str = "India"
     is_pep: bool = False
     is_aml_hit: bool = False
 
 # ===================================================================
-# 1. DOCUMENT OCR SERVICE (PaddleOCR)
-# Mapped to update: u_documents.u_ocr_result
+# 1. DOCUMENT OCR SERVICE (Accepts Raw Binary Body from ServiceNow)
+# Mapped to update: x_snc_flow4now_b_0_documents.u_ocr_result
 # ===================================================================
 @app.post("/api/v1/ocr/document", tags=["Document OCR"])
 async def process_document_ocr(
-    document: UploadFile = File(...),
-    document_type: str = Form("PAN"),
-    language: str = Form("eng"),
-    ocr_engine: int = Form(2),  # Default to Engine 2 as recommended for IDs/documents
-    is_table: bool = Form(False)
+    request: Request,
+    document_type: str = Query("PAN"),
+    language: str = Query("eng"),
+    ocr_engine: int = Query(2),  # Engine 2 recommended for IDs/documents
+    is_table: bool = Query(False)
 ):
     try:
-        # Read uploaded file content
-        file_bytes = await document.read()
+        # Read raw binary content sent by setRequestBodyFromAttachment()
+        file_bytes = await request.body()
 
-        # Prepare payload and files for OCR.Space API
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Empty file payload received from ServiceNow.")
+
+        # Determine filename/content-type from request headers or default safely
+        content_type = request.headers.get("content-type", "image/jpeg")
+        filename = "servicenow_attachment.jpg"
+        if "png" in content_type:
+            filename = "servicenow_attachment.png"
+        elif "pdf" in content_type:
+            filename = "servicenow_attachment.pdf"
+
+        # Prepare payload and multipart file object for OCR.Space API
         payload = {
             "apikey": OCR_SPACE_API_KEY,
             "language": language,
@@ -66,7 +77,7 @@ async def process_document_ocr(
         }
         
         files = {
-            "file": (document.filename, file_bytes, document.content_type)
+            "file": (filename, file_bytes, content_type)
         }
 
         # Make async HTTP POST request to OCR.Space API
@@ -104,14 +115,19 @@ async def process_document_ocr(
             "document_type": document_type,
             "ocr_result": full_extracted_text,
             "processing_time_ms": ocr_data.get("ProcessingTimeInMilliseconds"),
-            "raw_ocr_response": ocr_data  # Save this directly to ServiceNow u_verification_log
+            "raw_ocr_response": ocr_data
         }
 
     except httpx.RequestError as exc:
         raise HTTPException(status_code=500, detail=f"HTTP Request failed: {str(exc)}")
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR Engine Failure: {str(e)}")# 2. AI DOCUMENT REVIEW ENGINE (Gemini 2.5 Flash)
-# Mapped to update: u_documents.u_ai_review & u_application_case.u_ai_recommendation
+        raise HTTPException(status_code=500, detail=f"OCR Engine Failure: {str(e)}")
+
+# ===================================================================
+# 2. AI DOCUMENT REVIEW ENGINE (Gemini 2.5 Flash)
+# Mapped to update: x_snc_flow4now_b_0_documents.u_ai_review & x_snc_flow4now_b_0_application_case.u_ai_recommendation
 # ===================================================================
 @app.post("/api/v1/ai/review-document", tags=["AI Compliance Review"])
 def review_document_with_gemini(payload: AIReviewRequest):
@@ -166,7 +182,7 @@ def review_document_with_gemini(payload: AIReviewRequest):
 
 # ===================================================================
 # 3. RULE-BASED RISK ENGINE
-# Mapped to update: u_application_case.u_risk_level
+# Mapped to update: x_snc_flow4now_b_0_application_case.u_risk_level
 # ===================================================================
 @app.post("/api/v1/risk/calculate", tags=["Risk Engine"])
 def calculate_case_risk(payload: RiskAssessmentRequest):
@@ -192,7 +208,7 @@ def calculate_case_risk(payload: RiskAssessmentRequest):
         risk_score += 35
         risk_factors.append("Income bracket mismatched with occupation")
 
-    # Risk Tier Classification (Mapped to Choice List values on u_application_case.u_risk_level)
+    # Risk Tier Classification (Mapped to Choice List values on x_snc_flow4now_b_0_application_case.u_risk_level)
     if risk_score >= 80:
         risk_level = "Critical"
     elif risk_score >= 50:
