@@ -1,11 +1,8 @@
 import os
-import re
+import httpx
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
-import cv2
-import numpy as np
-from paddleocr import PaddleOCR
 from google import genai
 from google.genai import types
 
@@ -15,9 +12,10 @@ app = FastAPI(
     description="Backend microservices for Document OCR, Gemini AI Review, and Risk Scoring."
 )
 
-# Initialize Engine Instances
-ocr_engine = PaddleOCR(use_angle_cls=True, lang='en')
+# Initialize Gemini Client
 gemini_client = genai.Client()
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
+OCR_SPACE_URL = "https://api.ocr.space/parse/image"
 
 # ===================================================================
 # PYDANTIC SCHEMAS (Mapped directly to ServiceNow Table Fields)
@@ -45,17 +43,6 @@ class RiskAssessmentRequest(BaseModel):
 # 1. DOCUMENT OCR SERVICE (PaddleOCR)
 # Mapped to update: u_documents.u_ocr_result
 # ===================================================================
-import os
-import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
-from typing import Optional
-
-app = FastAPI()
-
-# Retrieve your OCR.Space API Key from environment variables (Default: 'helloworld' for testing)
-OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
-OCR_SPACE_URL = "https://api.ocr.space/parse/image"
-
 @app.post("/api/v1/ocr/document", tags=["Document OCR"])
 async def process_document_ocr(
     document: UploadFile = File(...),
