@@ -37,12 +37,6 @@ otp_store: Dict[str, Dict[str, Any]] = {}
 # -------------------------------------------------------------------
 # PYDANTIC SCHEMAS
 # -------------------------------------------------------------------
-class OTPRequest(BaseModel):
-    email: EmailStr
-
-class OTPVerifyRequest(BaseModel):
-    email: EmailStr
-    otp: str
 
 class AIReviewRequest(BaseModel):
     ocr_text: str
@@ -58,48 +52,7 @@ class RiskAssessmentRequest(BaseModel):
     is_pep: bool = False
     is_aml_hit: bool = False
 
-# -------------------------------------------------------------------
-# 1. EMAIL OTP SERVICE ENDPOINTS
-# -------------------------------------------------------------------
-@app.post("/api/v1/otp/send", tags=["OTP Service"])
-def send_otp(payload: OTPRequest):
-    generated_otp = str(random.randint(100000, 999999))
-    expiry_time = time.time() + 300  # 5 minutes validity
 
-    otp_store[payload.email] = {
-        "otp": generated_otp,
-        "expiry": expiry_time,
-        "verified": False
-    }
-
-    # Integrate your SMTP email sender here
-    print(f"[OTP SERVICE] Sent OTP {generated_otp} to {payload.email}")
-
-    return {
-        "status": "success",
-        "message": f"OTP successfully dispatched to {payload.email}",
-        "expires_in_seconds": 300
-    }
-
-@app.post("/api/v1/otp/verify", tags=["OTP Service"])
-def verify_otp(payload: OTPVerifyRequest):
-    record = otp_store.get(payload.email)
-    
-    if not record:
-        raise HTTPException(status_code=400, detail="No OTP requested for this email address.")
-    
-    if time.time() > record["expiry"]:
-        raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
-        
-    if record["otp"] != payload.otp:
-        raise HTTPException(status_code=400, detail="Invalid OTP entered.")
-
-    record["verified"] = True
-    return {
-        "status": "success",
-        "verified": True,
-        "message": "Email verification successful."
-    }
 
 # -------------------------------------------------------------------
 # 2. DOCUMENT OCR SERVICE (PaddleOCR)
@@ -187,66 +140,6 @@ def review_document_with_gemini(payload: AIReviewRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini Review Engine Error: {str(e)}")
-
-# -------------------------------------------------------------------
-# 4. FACE LIVENESS ENGINE (MediaPipe)
-# -------------------------------------------------------------------
-@app.post("/api/v1/liveness/check", tags=["Face Liveness"])
-async def check_face_liveness(image: UploadFile = File(...)):
-    try:
-        contents = await image.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if frame is None:
-            raise HTTPException(status_code=400, detail="Invalid video frame.")
-
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        with mp_face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5
-        ) as face_mesh:
-            
-            results = face_mesh.process(rgb_frame)
-
-            if not results.multi_face_landmarks:
-                return {
-                    "status": "failed",
-                    "passed": False,
-                    "reason": "No human face detected in frame."
-                }
-
-            face_landmarks = results.multi_face_landmarks[0].landmark
-
-            # Eye Aspect Ratio (EAR) Landmarks for blink detection
-            # Left eye landmarks: 33, 160, 158, 133, 153, 144
-            p2_p6 = np.linalg.norm(np.array([face_landmarks[160].x, face_landmarks[160].y]) - np.array([face_landmarks[144].x, face_landmarks[144].y]))
-            p3_p5 = np.linalg.norm(np.array([face_landmarks[158].x, face_landmarks[158].y]) - np.array([face_landmarks[153].x, face_landmarks[153].y]))
-            p1_p4 = np.linalg.norm(np.array([face_landmarks[33].x, face_landmarks[33].y]) - np.array([face_landmarks[133].x, face_landmarks[133].y]))
-            
-            ear = (p2_p6 + p3_p5) / (2.0 * p1_p4)
-
-            # Nose Tip for Head Orientation
-            nose_x = face_landmarks[1].x
-
-            # Basic Passive/Liveness Confidence Score
-            liveness_passed = True if ear > 0.15 else False
-
-            return {
-                "status": "success",
-                "passed": liveness_passed,
-                "metrics": {
-                    "eye_aspect_ratio": round(float(ear), 4),
-                    "nose_center_x": round(float(nose_x), 4)
-                },
-                "confidence": 0.96 if liveness_passed else 0.42
-            }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Liveness Processing Error: {str(e)}")
 
 # -------------------------------------------------------------------
 # 5. RULE-BASED RISK ENGINE
