@@ -45,42 +45,85 @@ class RiskAssessmentRequest(BaseModel):
 # 1. DOCUMENT OCR SERVICE (PaddleOCR)
 # Mapped to update: u_documents.u_ocr_result
 # ===================================================================
+import os
+import httpx
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
+from typing import Optional
+
+app = FastAPI()
+
+# Retrieve your OCR.Space API Key from environment variables (Default: 'helloworld' for testing)
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
+OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+
 @app.post("/api/v1/ocr/document", tags=["Document OCR"])
 async def process_document_ocr(
     document: UploadFile = File(...),
-    document_type: str = Form("PAN")
+    document_type: str = Form("PAN"),
+    language: str = Form("eng"),
+    ocr_engine: int = Form(2),  # Default to Engine 2 as recommended for IDs/documents
+    is_table: bool = Form(False)
 ):
     try:
-        contents = await document.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        # Read uploaded file content
+        file_bytes = await document.read()
 
-        if img is None:
-            raise HTTPException(status_code=400, detail="Invalid image upload.")
-
-        result = ocr_engine.ocr(img, cls=True)
-        extracted_lines = []
+        # Prepare payload and files for OCR.Space API
+        payload = {
+            "apikey": OCR_SPACE_API_KEY,
+            "language": language,
+            "OCREngine": ocr_engine,
+            "isTable": is_table,
+            "detectOrientation": True,
+            "scale": True,
+        }
         
-        if result and result[0]:
-            for line in result[0]:
-                text_content = line[1][0]
-                confidence = line[1][1]
-                if confidence > 0.4:
-                    extracted_lines.append(text_content)
+        files = {
+            "file": (document.filename, file_bytes, document.content_type)
+        }
 
-        full_text = "\n".join(extracted_lines)
+        # Make async HTTP POST request to OCR.Space API
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(OCR_SPACE_URL, data=payload, files=files)
+            
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code, 
+                detail=f"OCR.Space API error: {response.text}"
+            )
+
+        ocr_data = response.json()
+
+        # Check for API-level parsing errors
+        if ocr_data.get("IsErroredOnProcessing"):
+            error_msg = ocr_data.get("ErrorMessage") or "Failed to process document."
+            raise HTTPException(status_code=400, detail=f"OCR Processing Error: {error_msg}")
+
+        # Extract parsed text from response
+        parsed_results = ocr_data.get("ParsedResults", [])
+        extracted_text_list = []
+
+        for page in parsed_results:
+            if page.get("FileParseExitCode") == 1:
+                extracted_text_list.append(page.get("ParsedText", ""))
+            else:
+                error_details = page.get("ErrorMessage", "Unknown page parsing error")
+                raise HTTPException(status_code=400, detail=f"Page Parse Error: {error_details}")
+
+        full_extracted_text = "\n".join(extracted_text_list).strip()
 
         return {
             "status": "success",
             "document_type": document_type,
-            "ocr_result": full_text,
-            "line_count": len(extracted_lines)
+            "ocr_result": full_extracted_text,
+            "processing_time_ms": ocr_data.get("ProcessingTimeInMilliseconds"),
+            "raw_ocr_response": ocr_data  # Save this directly to ServiceNow u_verification_log
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR Engine Failure: {str(e)}")
 
-# ===================================================================
-# 2. AI DOCUMENT REVIEW ENGINE (Gemini 2.5 Flash)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=500, detail=f"HTTP Request failed: {str(exc)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR Engine Failure: {str(e)}")# 2. AI DOCUMENT REVIEW ENGINE (Gemini 2.5 Flash)
 # Mapped to update: u_documents.u_ai_review & u_application_case.u_ai_recommendation
 # ===================================================================
 @app.post("/api/v1/ai/review-document", tags=["AI Compliance Review"])
