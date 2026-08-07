@@ -1,0 +1,30 @@
+# Environment & secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# Python virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# Test & temp output files
+test_ocr.py
+ocr_result.txt
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

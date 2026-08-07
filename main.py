@@ -1,10 +1,14 @@
 import os
-import httpx
+import base64
+import time
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, Query, Header
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
+load_dotenv()  # picks up GEMINI_API_KEY from .env
 
 app = FastAPI(
     title="ServiceNow KYC Core Verification API",
@@ -12,10 +16,8 @@ app = FastAPI(
     description="Backend microservices for Document OCR, Gemini AI Review, and Risk Scoring."
 )
 
-# Initialize Gemini Client
-gemini_client = genai.Client()
-OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
-OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+# Initialize Gemini Client (reads GEMINI_API_KEY from environment automatically)
+gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ===================================================================
 # PYDANTIC SCHEMAS (Mapped directly to ServiceNow Table Fields)
@@ -42,13 +44,14 @@ class RiskAssessmentRequest(BaseModel):
 # ===================================================================
 # 1. DOCUMENT OCR SERVICE (Accepts Raw Binary Body from ServiceNow)
 # Mapped to update: x_snc_flow4now_b_0_documents.u_ocr_result
+# Engine: Gemini 2.5 Flash Vision (replaces OCR.Space)
 # ===================================================================
 @app.post("/api/v1/ocr/document", tags=["Document OCR"])
 async def process_document_ocr(
     request: Request,
     document_type: str = Query("PAN"),
     language: str = Query("eng"),
-    ocr_engine: int = Query(2),  # Engine 2 recommended for IDs/documents
+    ocr_engine: int = Query(2),   # kept for API compatibility — Gemini is used regardless
     is_table: bool = Query(False)
 ):
     try:
@@ -58,68 +61,72 @@ async def process_document_ocr(
         if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file payload received from ServiceNow.")
 
-        # Determine filename/content-type from request headers or default safely
+        # Detect MIME type from Content-Type header sent by ServiceNow
         content_type = request.headers.get("content-type", "image/jpeg")
-        filename = "servicenow_attachment.jpg"
         if "png" in content_type:
-            filename = "servicenow_attachment.png"
+            mime_type = "image/png"
         elif "pdf" in content_type:
-            filename = "servicenow_attachment.pdf"
+            mime_type = "application/pdf"
+        elif "webp" in content_type:
+            mime_type = "image/webp"
+        else:
+            mime_type = "image/jpeg"   # safe default for ID card photos
 
-        # Prepare payload and multipart file object for OCR.Space API
-        payload = {
-            "apikey": OCR_SPACE_API_KEY,
-            "language": language,
-            "OCREngine": ocr_engine,
-            "isTable": is_table,
-            "detectOrientation": True,
-            "scale": True,
-        }
-        
-        files = {
-            "file": (filename, file_bytes, content_type)
-        }
+        # Gemini Vision OCR prompt — extract raw text exactly as printed on document
+        ocr_prompt = (
+            f"You are a document OCR engine. This is a {document_type} identity document. "
+            "Extract ALL text visible in the image exactly as it appears — preserve spacing, "
+            "line breaks, and formatting. Return ONLY the raw extracted text with no additional "
+            "commentary, summary, or interpretation. Just output the full raw text string."
+        )
 
-        # Make async HTTP POST request to OCR.Space API
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(OCR_SPACE_URL, data=payload, files=files)
-            
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=response.status_code, 
-                detail=f"OCR.Space API error: {response.text}"
+        # Encode image as base64 inline data for Gemini Vision
+        b64_image = base64.standard_b64encode(file_bytes).decode("utf-8")
+        start_ms = int(time.time() * 1000)
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            inline_data=types.Blob(
+                                mime_type=mime_type,
+                                data=b64_image
+                            )
+                        ),
+                        types.Part(text=ocr_prompt),
+                    ]
+                )
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.0,          # fully deterministic — OCR must be exact
+                max_output_tokens=2048,
             )
+        )
 
-        ocr_data = response.json()
+        processing_time_ms = int(time.time() * 1000) - start_ms
+        extracted_text = response.text.strip() if response.text else ""
 
-        # Check for API-level parsing errors
-        if ocr_data.get("IsErroredOnProcessing"):
-            error_msg = ocr_data.get("ErrorMessage") or "Failed to process document."
-            raise HTTPException(status_code=400, detail=f"OCR Processing Error: {error_msg}")
-
-        # Extract parsed text from response
-        parsed_results = ocr_data.get("ParsedResults", [])
-        extracted_text_list = []
-
-        for page in parsed_results:
-            if page.get("FileParseExitCode") == 1:
-                extracted_text_list.append(page.get("ParsedText", ""))
-            else:
-                error_details = page.get("ErrorMessage", "Unknown page parsing error")
-                raise HTTPException(status_code=400, detail=f"Page Parse Error: {error_details}")
-
-        full_extracted_text = "\n".join(extracted_text_list).strip()
+        if not extracted_text:
+            raise HTTPException(
+                status_code=400,
+                detail="Gemini OCR returned an empty result. Check image quality, format, or GEMINI_API_KEY."
+            )
 
         return {
             "status": "success",
             "document_type": document_type,
-            "ocr_result": full_extracted_text,
-            "processing_time_ms": ocr_data.get("ProcessingTimeInMilliseconds"),
-            "raw_ocr_response": ocr_data
+            "ocr_result": extracted_text,
+            "processing_time_ms": processing_time_ms,
+            "raw_ocr_response": {
+                "engine": "gemini-2.5-flash-vision",
+                "mime_type_detected": mime_type,
+                "char_count": len(extracted_text),
+            }
         }
 
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=500, detail=f"HTTP Request failed: {str(exc)}")
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
