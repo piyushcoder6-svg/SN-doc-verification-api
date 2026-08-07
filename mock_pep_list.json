@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "description": "Mock PEP (Politically Exposed Persons) List — for hackathon demo only",
+  "entries": [
+    { "name": "Arvind Chauhan",     "role": "State Minister – Finance",         "party": "BJP",          "state": "Rajasthan",       "relation": "self" },
+    { "name": "Sunita Chauhan",     "role": "Spouse of State Minister",          "party": "BJP",          "state": "Rajasthan",       "relation": "spouse" },
+    { "name": "Ramesh Pillai",      "role": "IAS Officer – Joint Secretary",     "party": "N/A",          "state": "Kerala",          "relation": "self" },
+    { "name": "Sanjay Tiwari",      "role": "Member of Parliament",              "party": "INC",          "state": "Madhya Pradesh",  "relation": "self" },
+    { "name": "Meena Tiwari",       "role": "Daughter of MP Sanjay Tiwari",      "party": "N/A",          "state": "Madhya Pradesh",  "relation": "family" },
+    { "name": "Abdul Karim",        "role": "MLA – State Assembly",              "party": "AIMIM",        "state": "Telangana",       "relation": "self" },
+    { "name": "Harpreet Singh",     "role": "Punjab Police DGP (Retd)",          "party": "N/A",          "state": "Punjab",          "relation": "self" },
+    { "name": "Kavita Reddy",       "role": "Andhra Pradesh Cabinet Minister",   "party": "YSRCP",        "state": "Andhra Pradesh",  "relation": "self" },
+    { "name": "Vijay Malhotra",     "role": "Former Governor – Reserve Bank",    "party": "N/A",          "state": "Central",         "relation": "self" },
+    { "name": "Prashant Gupta",     "role": "Municipal Corporation Commissioner","party": "N/A",          "state": "Uttar Pradesh",   "relation": "self" },
+    { "name": "Lalitha Nair",       "role": "Spouse of IAS Joint Secretary",     "party": "N/A",          "state": "Kerala",          "relation": "spouse" },
+    { "name": "Arun Saxena",        "role": "Defence Ministry Senior Official",  "party": "N/A",          "state": "Central",         "relation": "self" }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "description": "Mock AML / Sanctions Watchlist — for hackathon demo only",
+  "entries": [
+    { "name": "Rahul Mehta",       "alias": ["R. Mehta"],           "reason": "Suspected hawala operator",          "country": "India" },
+    { "name": "Imran Sheikh",      "alias": ["Imran S."],           "reason": "Financial fraud FIR registered",     "country": "India" },
+    { "name": "Vikram Nair",       "alias": ["Vikram N."],          "reason": "PMLA case pending",                  "country": "India" },
+    { "name": "Anwar Hussain",     "alias": [],                     "reason": "OFAC SDN list match",                "country": "Pakistan" },
+    { "name": "Dawood Mirza",      "alias": ["D. Mirza"],           "reason": "Terror financing suspicion",         "country": "India" },
+    { "name": "Priya Kothari",     "alias": ["P. Kothari"],         "reason": "Shell company beneficial owner",     "country": "India" },
+    { "name": "Suresh Bansal",     "alias": ["S. Bansal"],          "reason": "ED lookout notice issued",           "country": "India" },
+    { "name": "Ravi Sharma",       "alias": ["Ravi S.", "R Sharma"],"reason": "Cryptocurrency money laundering",    "country": "India" },
+    { "name": "Fatima Al-Rashid",  "alias": [],                     "reason": "UN Sanctions List",                  "country": "UAE" },
+    { "name": "Gopal Agarwal",     "alias": ["G. Agarwal"],         "reason": "Bank fraud — CBI chargesheet",       "country": "India" },
+    { "name": "Nasrin Jafari",     "alias": [],                     "reason": "FATF high-risk jurisdiction link",   "country": "Iran" },
+    { "name": "Deepak Verma",      "alias": ["D.K. Verma"],         "reason": "Benami property transactions",       "country": "India" }
+  ]
+}

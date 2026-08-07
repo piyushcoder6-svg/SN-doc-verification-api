@@ -57,12 +57,13 @@ class AIReviewRequest(BaseModel):
 
 class RiskAssessmentRequest(BaseModel):
     case_sys_id: Optional[str] = Field(None, description="Sys ID of x_snc_flow4now_b_0_application_case record")
-    annual_income: str = Field(..., description="Mapped from annual_income")
-    occupation: str
-    account_type: str = Field(..., description="Mapped from account_type")
+    applicant_name: Optional[str] = Field("", description="Full name — used for AML/PEP auto-screening")
+    annual_income: str = Field(..., description="10-25 Lakhs | 5-10 Lakhs | Below 5 Lakhs")
+    occupation: str = Field(..., description="Business owner | Government employee | Salaried | Self employed | Student | Retired | Other")
+    account_type: str = Field(..., description="Business | Current | Salary | Joint | Savings | NRI")
     country: str = "India"
-    is_pep: bool = False
-    is_aml_hit: bool = False
+    is_pep: bool = False       # auto-detected from name OR set manually
+    is_aml_hit: bool = False   # auto-detected from name OR set manually
 
 # ===================================================================
 # 1. DOCUMENT OCR SERVICE (Accepts Raw Binary Body from ServiceNow)
@@ -209,54 +210,36 @@ async def process_document_ocr(
 @app.post("/api/v1/ai/review-document", tags=["AI Compliance Review"])
 def review_document_with_gemini(payload: AIReviewRequest):
     try:
-        log.info(f"AI Review | case={payload.case_sys_id} | doc_type={payload.document_type} | name='{payload.customer_name}' | dob='{payload.dob}' | gender='{payload.gender}'")
-        log.info(f"AI Review | ocr_text length={len(payload.ocr_text or '')} chars")
-
         prompt = f"""
-You are a KYC Compliance AI for a bank onboarding system. Your job is to compare the customer's
-submitted form data against text extracted from their identity document (via OCR).
+        You are a ServiceNow Automated KYC Compliance Reviewer.
+        Compare the extracted document text against the customer details submitted in the application case.
 
-CUSTOMER FORM DATA (what the customer entered):
-- Document Type : {payload.document_type}
-- Full Name     : {payload.customer_name or '[not provided]'}
-- Date of Birth : {payload.dob or '[not provided]'}
-- Gender        : {payload.gender or '[not provided]'}
-- Address       : {payload.address or '[not provided]'}
+        Customer Form Details:
+        - Document Type: {payload.document_type}
+        - Full Name: {payload.customer_name}
+        - Date of Birth: {payload.dob}
+        - Gender: {payload.gender}
+        - Address: {payload.address}
 
-EXTRACTED OCR TEXT FROM DOCUMENT:
----
-{payload.ocr_text}
----
+        Extracted OCR Text:
+        ---
+        {payload.ocr_text}
+        ---
 
-COMPARISON RULES — follow these strictly:
-1. DATE FORMAT DIFFERENCES ARE NOT DISCREPANCIES. Dates like "14/06/2006", "2006-06-14",
-   "June 14, 2006" all represent the same date. Compare semantically, not character-by-character.
-2. DO NOT flag Aadhaar numbers, PAN numbers, VID numbers, or Enrolment numbers as discrepancies.
-   These are identity card numbers and are NOT fields submitted on the customer form.
-3. If a customer form field is blank or '[not provided]', skip that field entirely — do NOT
-   list it as a discrepancy. Only compare fields where the customer actually provided data.
-4. ONLY flag a discrepancy if the customer provided a value AND it genuinely conflicts with
-   what is written on the document (e.g. name "Rahul" on form but "Ravi" on document).
-5. Minor spelling variations or abbreviations (e.g. "Piyush Pareek" vs "PIYUSH PAREEK") are
-   NOT discrepancies. Use fuzzy/semantic matching.
+        Perform these checks:
+        1. Compare Name, DOB, and ID numbers (PAN/Aadhaar) for exact or fuzzy matches.
+        2. Detect discrepancies, missing fields, or invalid layout structure.
+        3. Formulate a final recommendation for the assigned Compliance Officer.
 
-Return strictly valid JSON with this exact structure:
-{{
-    "verification_status": "VERIFIED",
-    "ai_recommendation": "APPROVE",
-    "confidence_score": 0.95,
-    "discrepancies": [],
-    "comments": "Concise 2-sentence summary for the compliance officer."
-}}
-
-Where:
-- verification_status: "VERIFIED" (all provided fields match), "FAILED" (genuine mismatch found),
-  or "SUSPICIOUS" (something looks wrong but not a clear mismatch)
-- ai_recommendation: "APPROVE", "REJECT", or "MANUAL_REVIEW"
-- confidence_score: float between 0.0 and 1.0
-- discrepancies: list of actual mismatches only (empty list [] if everything matches)
-- comments: 1-2 sentence plain English summary for the officer
-"""
+        Return strictly valid JSON with this exact structure:
+        {{
+            "verification_status": "VERIFIED | FAILED | SUSPICIOUS",
+            "ai_recommendation": "APPROVE | REJECT | MANUAL_REVIEW",
+            "confidence_score": 0.95,
+            "discrepancies": ["List any mismatches here"],
+            "comments": "Concise 2-sentence summary for the officer workspace."
+        }}
+        """
 
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
@@ -267,55 +250,179 @@ Where:
             )
         )
 
-        log.info(f"AI Review | case={payload.case_sys_id} | response={response.text[:200] if response.text else 'EMPTY'}")
-
         return {
             "status": "success",
             "case_sys_id": payload.case_sys_id,
             "review_output": response.text
         }
     except Exception as e:
-        log.error(f"AI Review FAILED | case={payload.case_sys_id} | error={str(e)}")
         raise HTTPException(status_code=500, detail=f"Gemini Review Failure: {str(e)}")
-
 
 # ===================================================================
 # 3. RULE-BASED RISK ENGINE
 # Mapped to update: x_snc_flow4now_b_0_application_case.u_risk_level
 # ===================================================================
+
+import json as _json
+
+# Load mock AML + PEP lists once at startup
+_AML_LIST: List[Dict] = []
+_PEP_LIST: List[Dict] = []
+try:
+    _aml_path = os.path.join(os.path.dirname(__file__), "mock_aml_list.json")
+    _pep_path = os.path.join(os.path.dirname(__file__), "mock_pep_list.json")
+    with open(_aml_path, encoding="utf-8") as f:
+        _AML_LIST = _json.load(f)["entries"]
+    with open(_pep_path, encoding="utf-8") as f:
+        _PEP_LIST = _json.load(f)["entries"]
+    log.info(f"AML list loaded: {len(_AML_LIST)} entries | PEP list loaded: {len(_PEP_LIST)} entries")
+except Exception as e:
+    log.warning(f"Could not load AML/PEP mock lists: {e}")
+
+
+# ── Scoring tables ────────────────────────────────────────────────────────────
+_INCOME_SCORES: Dict[str, int] = {
+    "10-25 Lakhs":  10,
+    "5-10 Lakhs":    5,
+    "Below 5 Lakhs": 0,
+}
+
+_OCCUPATION_SCORES: Dict[str, int] = {
+    "Business owner":      20,   # cash-intensive, ownership complexity
+    "Self employed":       15,   # irregular income, harder to verify
+    "Student":             10,   # income claim unusual
+    "Other":               10,   # unknown occupation = elevated scrutiny
+    "Retired":              5,   # fixed income, moderate
+    "Government employee":  0,   # verifiable, low risk
+    "Salaried":             0,   # verifiable, low risk
+}
+
+_ACCOUNT_SCORES: Dict[str, int] = {
+    "NRI":      20,   # cross-border, FEMA compliance needed
+    "Business": 15,   # high volume, cash transactions
+    "Current":  10,   # business usage, higher transaction limits
+    "Joint":     5,   # multiple beneficial owners
+    "Savings":   0,   # standard retail
+    "Salary":    0,   # directly linked to employer
+}
+
+# Income vs Occupation mismatch rules: (income, occupation, extra_points, reason)
+_INCOME_OCCUPATION_MISMATCH = [
+    ("10-25 Lakhs", "Student",      35, "Very high income declared by a Student"),
+    ("5-10 Lakhs",  "Student",      20, "High income declared by a Student"),
+    ("10-25 Lakhs", "Retired",      15, "Unusually high income for Retired person"),
+    ("Below 5 Lakhs", "Business owner", 15, "Business owner with very low declared income (possible under-reporting)"),
+]
+
+# Account vs Occupation mismatch rules: (account_type, occupation, extra_points, reason)
+_ACCOUNT_OCCUPATION_MISMATCH = [
+    ("Business", "Student",            20, "Business account held by Student"),
+    ("Business", "Salaried",           10, "Business account for a Salaried employee"),
+    ("NRI",      "Government employee", 15, "Government employee holding NRI account"),
+    ("NRI",      "Student",            15, "Student holding NRI account"),
+]
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _name_match(name: str, entries: List[Dict]) -> Optional[Dict]:
+    """Case-insensitive full-name match (also checks aliases)."""
+    if not name:
+        return None
+    name_lower = name.strip().lower()
+    for entry in entries:
+        if entry["name"].lower() == name_lower:
+            return entry
+        for alias in entry.get("alias", []):
+            if alias.lower() == name_lower:
+                return entry
+    return None
+
+
 @app.post("/api/v1/risk/calculate", tags=["Risk Engine"])
 def calculate_case_risk(payload: RiskAssessmentRequest):
     risk_score = 0
-    risk_factors = []
+    risk_factors: List[str] = []
+    is_pep = payload.is_pep
+    is_aml_hit = payload.is_aml_hit
 
-    # Rule 1: Watchlist & Sanctions Check
-    if payload.is_aml_hit:
+    # ── Auto AML/PEP screening by name ───────────────────────────────────────
+    if payload.applicant_name:
+        aml_match = _name_match(payload.applicant_name, _AML_LIST)
+        if aml_match:
+            is_aml_hit = True
+            risk_factors.append(f"AML/Sanctions hit: {aml_match['reason']}")
+            log.warning(f"AML hit for name='{payload.applicant_name}' | reason={aml_match['reason']}")
+
+        pep_match = _name_match(payload.applicant_name, _PEP_LIST)
+        if pep_match:
+            is_pep = True
+            risk_factors.append(f"PEP match: {pep_match['role']} ({pep_match['state']})")
+            log.warning(f"PEP hit for name='{payload.applicant_name}' | role={pep_match['role']}")
+
+    # ── Rule 1: AML — always forces Critical ─────────────────────────────────
+    if is_aml_hit:
         risk_score += 100
-        risk_factors.append("AML / Sanctions Watchlist Match")
+        if "AML/Sanctions hit" not in " ".join(risk_factors):   # avoid duplicate
+            risk_factors.append("AML / Sanctions Watchlist Match")
 
-    # Rule 2: PEP Status
-    if payload.is_pep:
+    # ── Rule 2: PEP ──────────────────────────────────────────────────────────
+    if is_pep:
         risk_score += 40
-        risk_factors.append("Politically Exposed Person (PEP)")
+        if "PEP match" not in " ".join(risk_factors):
+            risk_factors.append("Politically Exposed Person (PEP)")
 
-    # Rule 3: High Net Worth / Business Account Discrepancies
-    if payload.account_type == "Business" and payload.annual_income in ["10-25 Lakhs", "25+ Lakhs"]:
+    # ── Rule 3: Income band base score ───────────────────────────────────────
+    income_pts = _INCOME_SCORES.get(payload.annual_income, 5)
+    if income_pts > 0:
+        risk_score += income_pts
+        risk_factors.append(f"Income band: {payload.annual_income} (+{income_pts} pts)")
+
+    # ── Rule 4: Occupation base score ────────────────────────────────────────
+    occ_pts = _OCCUPATION_SCORES.get(payload.occupation, 10)
+    if occ_pts > 0:
+        risk_score += occ_pts
+        risk_factors.append(f"Occupation risk: {payload.occupation} (+{occ_pts} pts)")
+
+    # ── Rule 5: Account type base score ──────────────────────────────────────
+    acc_pts = _ACCOUNT_SCORES.get(payload.account_type, 5)
+    if acc_pts > 0:
+        risk_score += acc_pts
+        risk_factors.append(f"Account type: {payload.account_type} (+{acc_pts} pts)")
+
+    # ── Rule 6: Income vs Occupation mismatch ────────────────────────────────
+    for income, occ, pts, reason in _INCOME_OCCUPATION_MISMATCH:
+        if payload.annual_income == income and payload.occupation == occ:
+            risk_score += pts
+            risk_factors.append(f"Mismatch: {reason} (+{pts} pts)")
+
+    # ── Rule 7: Account vs Occupation mismatch ───────────────────────────────
+    for acc, occ, pts, reason in _ACCOUNT_OCCUPATION_MISMATCH:
+        if payload.account_type == acc and payload.occupation == occ:
+            risk_score += pts
+            risk_factors.append(f"Mismatch: {reason} (+{pts} pts)")
+
+    # ── Rule 8: Non-India country ─────────────────────────────────────────────
+    if payload.country.strip().lower() not in ("india", "in", ""):
         risk_score += 15
-        risk_factors.append("High volume business account")
+        risk_factors.append(f"Foreign country exposure: {payload.country} (+15 pts)")
 
-    if payload.annual_income == "25+ Lakhs" and payload.occupation in ["Student", "Unemployed"]:
-        risk_score += 35
-        risk_factors.append("Income bracket mismatched with occupation")
+    # ── Cap & Tier ────────────────────────────────────────────────────────────
+    risk_score = min(risk_score, 100)
 
-    # Risk Tier Classification (Mapped to Choice List values on x_snc_flow4now_b_0_application_case.u_risk_level)
-    if risk_score >= 80:
+    if risk_score >= 75 or is_aml_hit:
         risk_level = "Critical"
-    elif risk_score >= 50:
+        routing = "SAR_INVESTIGATOR"
+    elif risk_score >= 50 or is_pep:
         risk_level = "High"
+        routing = "COMPLIANCE_OFFICER"
     elif risk_score >= 20:
         risk_level = "Medium"
+        routing = "SENIOR_OFFICER"
     else:
         risk_level = "Low"
+        routing = "STANDARD_QUEUE"
+
+    log.info(f"Risk calculated | name={payload.applicant_name!r} income={payload.annual_income} occ={payload.occupation} acc={payload.account_type} score={risk_score} tier={risk_level}")
 
     return {
         "status": "success",
@@ -323,7 +430,9 @@ def calculate_case_risk(payload: RiskAssessmentRequest):
         "risk_score": risk_score,
         "risk_level": risk_level,
         "risk_factors": risk_factors,
-        "recommended_routing": "AUTO_ASSIGN_SENIOR_OFFICER" if risk_level in ["High", "Critical"] else "STANDARD_QUEUE"
+        "aml_detected": is_aml_hit,
+        "pep_detected": is_pep,
+        "recommended_routing": routing
     }
 
 # ===================================================================
@@ -331,7 +440,14 @@ def calculate_case_risk(payload: RiskAssessmentRequest):
 # ===================================================================
 @app.get("/health", tags=["System"])
 def health_check():
-    return {"status": "healthy", "engine": "KYC Core FastAPI Microservice"}
+    aml_count = len(_AML_LIST)
+    pep_count = len(_PEP_LIST)
+    return {
+        "status": "healthy",
+        "engine": "KYC Core FastAPI Microservice",
+        "aml_list_entries": aml_count,
+        "pep_list_entries": pep_count
+    }
 
 if __name__ == "__main__":
     import uvicorn
