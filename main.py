@@ -44,8 +44,30 @@ class RiskAssessmentRequest(BaseModel):
 # ===================================================================
 # 1. DOCUMENT OCR SERVICE (Accepts Raw Binary Body from ServiceNow)
 # Mapped to update: x_snc_flow4now_b_0_documents.u_ocr_result
-# Engine: Gemini 2.5 Flash Vision (replaces OCR.Space)
+# Engine: Gemini 2.5 Flash Vision (images) + File API (PDFs)
 # ===================================================================
+
+def _detect_mime_from_bytes(file_bytes: bytes, header_content_type: str) -> str:
+    """Detect MIME type from magic bytes — more reliable than trusting Content-Type header."""
+    if file_bytes[:4] == b'%PDF':
+        return "application/pdf"
+    if file_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if file_bytes[:2] in (b'\xff\xd8',) or file_bytes[:4] in (b'\xff\xe0', b'\xff\xe1'):
+        return "image/jpeg"
+    if len(file_bytes) > 12 and file_bytes[:4] == b'RIFF' and file_bytes[8:12] == b'WEBP':
+        return "image/webp"
+    # Fallback: trust Content-Type header
+    ct = header_content_type.lower()
+    if "png" in ct:
+        return "image/png"
+    if "pdf" in ct:
+        return "application/pdf"
+    if "webp" in ct:
+        return "image/webp"
+    return "image/jpeg"
+
+
 @app.post("/api/v1/ocr/document", tags=["Document OCR"])
 async def process_document_ocr(
     request: Request,
@@ -54,6 +76,8 @@ async def process_document_ocr(
     ocr_engine: int = Query(2),   # kept for API compatibility — Gemini is used regardless
     is_table: bool = Query(False)
 ):
+    import tempfile, os as _os
+
     try:
         # Read raw binary content sent by setRequestBodyFromAttachment()
         file_bytes = await request.body()
@@ -61,28 +85,56 @@ async def process_document_ocr(
         if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file payload received from ServiceNow.")
 
-        # Detect MIME type from Content-Type header sent by ServiceNow
-        content_type = request.headers.get("content-type", "image/jpeg")
-        if "png" in content_type:
-            mime_type = "image/png"
-        elif "pdf" in content_type:
-            mime_type = "application/pdf"
-        elif "webp" in content_type:
-            mime_type = "image/webp"
-        else:
-            mime_type = "image/jpeg"   # safe default for ID card photos
+        # Reliably detect MIME type from magic bytes (don't trust Content-Type alone)
+        header_ct = request.headers.get("content-type", "image/jpeg")
+        mime_type = _detect_mime_from_bytes(file_bytes, header_ct)
 
-        # Gemini Vision OCR prompt — extract raw text exactly as printed on document
         ocr_prompt = (
             f"You are a document OCR engine. This is a {document_type} identity document. "
-            "Extract ALL text visible in the image exactly as it appears — preserve spacing, "
+            "Extract ALL text visible in the document exactly as it appears — preserve spacing, "
             "line breaks, and formatting. Return ONLY the raw extracted text with no additional "
             "commentary, summary, or interpretation. Just output the full raw text string."
         )
 
-        # Encode image as base64 inline data for Gemini Vision
-        b64_image = base64.standard_b64encode(file_bytes).decode("utf-8")
         start_ms = int(time.time() * 1000)
+
+        if mime_type == "application/pdf":
+            # PDFs MUST use the Gemini File API — inline base64 is NOT supported for PDFs
+            suffix = ".pdf"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            try:
+                uploaded = gemini_client.files.upload(
+                    file=tmp_path,
+                    config={"mime_type": "application/pdf", "display_name": f"{document_type}_upload.pdf"}
+                )
+                # Wait until Gemini has finished processing the file
+                import time as _time
+                for _ in range(15):  # max ~15 seconds
+                    file_info = gemini_client.files.get(name=uploaded.name)
+                    if hasattr(file_info, 'state') and str(file_info.state).endswith("PROCESSING"):
+                        _time.sleep(1)
+                    else:
+                        break
+
+                doc_part = types.Part(
+                    file_data=types.FileData(
+                        file_uri=uploaded.uri,
+                        mime_type="application/pdf"
+                    )
+                )
+            finally:
+                _os.unlink(tmp_path)
+        else:
+            # Images (JPEG, PNG, WebP) — inline base64 works fine
+            b64_image = base64.standard_b64encode(file_bytes).decode("utf-8")
+            doc_part = types.Part(
+                inline_data=types.Blob(
+                    mime_type=mime_type,
+                    data=b64_image
+                )
+            )
 
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
@@ -90,18 +142,13 @@ async def process_document_ocr(
                 types.Content(
                     role="user",
                     parts=[
-                        types.Part(
-                            inline_data=types.Blob(
-                                mime_type=mime_type,
-                                data=b64_image
-                            )
-                        ),
+                        doc_part,
                         types.Part(text=ocr_prompt),
                     ]
                 )
             ],
             config=types.GenerateContentConfig(
-                temperature=0.0,          # fully deterministic — OCR must be exact
+                temperature=0.0,
                 max_output_tokens=2048,
             )
         )
@@ -112,7 +159,7 @@ async def process_document_ocr(
         if not extracted_text:
             raise HTTPException(
                 status_code=400,
-                detail="Gemini OCR returned an empty result. Check image quality, format, or GEMINI_API_KEY."
+                detail="Gemini OCR returned an empty result. Check document quality or GEMINI_API_KEY."
             )
 
         return {
