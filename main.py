@@ -1,6 +1,7 @@
 import os
 import base64
 import time
+import logging
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, Query, Header
 from pydantic import BaseModel, Field
@@ -10,14 +11,36 @@ from google.genai import types
 
 load_dotenv()  # picks up GEMINI_API_KEY from .env
 
+# ── Logging setup (visible in Render log panel) ──────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S"
+)
+log = logging.getLogger("kyc_api")
+# ─────────────────────────────────────────────────────────────────────────────
+
 app = FastAPI(
     title="ServiceNow KYC Core Verification API",
     version="2.0.0",
     description="Backend microservices for Document OCR, Gemini AI Review, and Risk Scoring."
 )
 
-# Initialize Gemini Client (reads GEMINI_API_KEY from environment automatically)
+# ── Request/Response logging middleware ───────────────────────────────────────
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    log.info(f">>> {request.method} {request.url.path} | params={dict(request.query_params)} | content-type={request.headers.get('content-type','')}")
+    response = await call_next(request)
+    elapsed_ms = round((time.time() - start) * 1000)
+    log.info(f"<<< {request.method} {request.url.path} | status={response.status_code} | {elapsed_ms}ms")
+    return response
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Initialize Gemini Client
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+log.info(f"Gemini client initialized | key_prefix={os.getenv('GEMINI_API_KEY','')[:10]}...")
+
 
 # ===================================================================
 # PYDANTIC SCHEMAS (Mapped directly to ServiceNow Table Fields)
@@ -186,36 +209,54 @@ async def process_document_ocr(
 @app.post("/api/v1/ai/review-document", tags=["AI Compliance Review"])
 def review_document_with_gemini(payload: AIReviewRequest):
     try:
+        log.info(f"AI Review | case={payload.case_sys_id} | doc_type={payload.document_type} | name='{payload.customer_name}' | dob='{payload.dob}' | gender='{payload.gender}'")
+        log.info(f"AI Review | ocr_text length={len(payload.ocr_text or '')} chars")
+
         prompt = f"""
-        You are a ServiceNow Automated KYC Compliance Reviewer.
-        Compare the extracted document text against the customer details submitted in the application case.
+You are a KYC Compliance AI for a bank onboarding system. Your job is to compare the customer's
+submitted form data against text extracted from their identity document (via OCR).
 
-        Customer Form Details:
-        - Document Type: {payload.document_type}
-        - Full Name: {payload.customer_name}
-        - Date of Birth: {payload.dob}
-        - Gender: {payload.gender}
-        - Address: {payload.address}
+CUSTOMER FORM DATA (what the customer entered):
+- Document Type : {payload.document_type}
+- Full Name     : {payload.customer_name or '[not provided]'}
+- Date of Birth : {payload.dob or '[not provided]'}
+- Gender        : {payload.gender or '[not provided]'}
+- Address       : {payload.address or '[not provided]'}
 
-        Extracted OCR Text:
-        ---
-        {payload.ocr_text}
-        ---
+EXTRACTED OCR TEXT FROM DOCUMENT:
+---
+{payload.ocr_text}
+---
 
-        Perform these checks:
-        1. Compare Name, DOB, and ID numbers (PAN/Aadhaar) for exact or fuzzy matches.
-        2. Detect discrepancies, missing fields, or invalid layout structure.
-        3. Formulate a final recommendation for the assigned Compliance Officer.
+COMPARISON RULES — follow these strictly:
+1. DATE FORMAT DIFFERENCES ARE NOT DISCREPANCIES. Dates like "14/06/2006", "2006-06-14",
+   "June 14, 2006" all represent the same date. Compare semantically, not character-by-character.
+2. DO NOT flag Aadhaar numbers, PAN numbers, VID numbers, or Enrolment numbers as discrepancies.
+   These are identity card numbers and are NOT fields submitted on the customer form.
+3. If a customer form field is blank or '[not provided]', skip that field entirely — do NOT
+   list it as a discrepancy. Only compare fields where the customer actually provided data.
+4. ONLY flag a discrepancy if the customer provided a value AND it genuinely conflicts with
+   what is written on the document (e.g. name "Rahul" on form but "Ravi" on document).
+5. Minor spelling variations or abbreviations (e.g. "Piyush Pareek" vs "PIYUSH PAREEK") are
+   NOT discrepancies. Use fuzzy/semantic matching.
 
-        Return strictly valid JSON with this exact structure:
-        {{
-            "verification_status": "VERIFIED | FAILED | SUSPICIOUS",
-            "ai_recommendation": "APPROVE | REJECT | MANUAL_REVIEW",
-            "confidence_score": 0.95,
-            "discrepancies": ["List any mismatches here"],
-            "comments": "Concise 2-sentence summary for the officer workspace."
-        }}
-        """
+Return strictly valid JSON with this exact structure:
+{{
+    "verification_status": "VERIFIED",
+    "ai_recommendation": "APPROVE",
+    "confidence_score": 0.95,
+    "discrepancies": [],
+    "comments": "Concise 2-sentence summary for the compliance officer."
+}}
+
+Where:
+- verification_status: "VERIFIED" (all provided fields match), "FAILED" (genuine mismatch found),
+  or "SUSPICIOUS" (something looks wrong but not a clear mismatch)
+- ai_recommendation: "APPROVE", "REJECT", or "MANUAL_REVIEW"
+- confidence_score: float between 0.0 and 1.0
+- discrepancies: list of actual mismatches only (empty list [] if everything matches)
+- comments: 1-2 sentence plain English summary for the officer
+"""
 
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
@@ -226,13 +267,17 @@ def review_document_with_gemini(payload: AIReviewRequest):
             )
         )
 
+        log.info(f"AI Review | case={payload.case_sys_id} | response={response.text[:200] if response.text else 'EMPTY'}")
+
         return {
             "status": "success",
             "case_sys_id": payload.case_sys_id,
             "review_output": response.text
         }
     except Exception as e:
+        log.error(f"AI Review FAILED | case={payload.case_sys_id} | error={str(e)}")
         raise HTTPException(status_code=500, detail=f"Gemini Review Failure: {str(e)}")
+
 
 # ===================================================================
 # 3. RULE-BASED RISK ENGINE
