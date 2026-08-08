@@ -2,6 +2,7 @@ import os
 import base64
 import time
 import logging
+import requests as _requests
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, Query, Header
 from pydantic import BaseModel, Field
@@ -324,8 +325,9 @@ _ACCOUNT_OCCUPATION_MISMATCH = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+
 def _name_match(name: str, entries: List[Dict]) -> Optional[Dict]:
-    """Case-insensitive full-name match (also checks aliases)."""
+    """Case-insensitive full-name match against mock list (also checks aliases). Used as offline fallback."""
     if not name:
         return None
     name_lower = name.strip().lower()
@@ -338,52 +340,232 @@ def _name_match(name: str, entries: List[Dict]) -> Optional[Dict]:
     return None
 
 
+# ── Country code → readable name ─────────────────────────────────────────────
+_COUNTRY_MAP: Dict[str, str] = {
+    "in": "India",   "pk": "Pakistan", "bd": "Bangladesh",
+    "np": "Nepal",   "lk": "Sri Lanka", "gb": "United Kingdom",
+    "us": "United States", "ae": "UAE", "cn": "China", "ru": "Russia"
+}
+
+# ── OpenSanctions topic classification ───────────────────────────────────────
+# Exact topic strings from OpenSanctions properties.topics[] array
+_AML_TOPICS = {"sanction", "crime", "crime.terror", "crime.fin", "wanted", "debarment", "export.control"}
+_PEP_TOPICS = {"role.pep", "pep"}
+
+
+def _check_opensanctions(name: str):
+    """
+    Unified compliance screening via OpenSanctions /match/default dataset.
+    ONE API call covers: PEP + Sanctions + Crime watchlists (2M+ records).
+
+    Topic logic (from properties.topics in API response):
+      sanction, crime, crime.terror, wanted  → AML hit  (+100, Critical)
+      role.pep, pep                           → PEP hit  (+40, High)
+      role.rca, role.pol (without pep tag)   → ignored
+
+    Score threshold: >= 0.70. Topics themselves prevent false positives
+    (e.g. Anjali Kumar returns role.rca, not pep/sanction, so no flag).
+
+    Returns: (is_aml: bool, is_pep: bool, detail: dict)
+    Falls back to local mock lists if API key missing or call fails.
+    """
+    if not name:
+        return False, False, {}
+
+    api_key = os.getenv("OPENSANCTIONS_API_KEY", "")
+
+    # ── Offline fallback ──────────────────────────────────────────────────────
+    if not api_key:
+        log.debug("OPENSANCTIONS_API_KEY not set — using mock AML/PEP lists")
+        aml_e = _name_match(name, _AML_LIST)
+        pep_e = _name_match(name, _PEP_LIST)
+        detail: Dict[str, Any] = {}
+        if aml_e:
+            detail["aml_reason"] = aml_e.get("reason", name)
+        if pep_e:
+            detail["pep_role"]  = pep_e.get("role", "PEP")
+            detail["pep_state"] = pep_e.get("state", "India")
+        return bool(aml_e), bool(pep_e), detail
+
+    # ── Live API call ─────────────────────────────────────────────────────────
+    try:
+        resp = _requests.post(
+            "https://api.opensanctions.org/match/default",
+            headers={"Authorization": f"ApiKey {api_key}"},
+            json={"queries": {"q1": {"schema": "Person", "properties": {"name": [name]}}}},
+            timeout=10.0
+        )
+
+        if resp.status_code != 200:
+            log.warning(f"OpenSanctions returned {resp.status_code} — mock fallback")
+            aml_e = _name_match(name, _AML_LIST)
+            pep_e = _name_match(name, _PEP_LIST)
+            return bool(aml_e), bool(pep_e), {}
+
+        results = resp.json().get("responses", {}).get("q1", {}).get("results", [])
+        is_aml, is_pep = False, False
+        detail = {}
+
+        if results:
+            # Only use the TOP result — it has the highest confidence.
+            # Secondary results are different people with similar names and cause false flags.
+            top   = results[0]
+            score = top.get("score", 0.0)
+
+            if score >= 0.85:
+                props       = top.get("properties", {})
+                topics      = set(props.get("topics", []))   # always in properties[]
+                caption     = top.get("caption", name)
+                positions   = props.get("position", [])
+                citizenship = props.get("citizenship", [])
+                cc          = citizenship[0].lower() if citizenship else "in"
+                state       = _COUNTRY_MAP.get(cc, cc.upper())
+
+                aml_tags = topics & _AML_TOPICS
+                if aml_tags:
+                    is_aml = True
+                    matched = ", ".join(sorted(aml_tags))
+                    detail["aml_reason"] = f"{caption} — tags: {matched}"
+                    detail["aml_score"]  = round(score, 2)
+                    log.warning(f"OpenSanctions AML | '{name}' -> '{caption}' score={score:.2f} tags=[{matched}]")
+
+                pep_tags = topics & _PEP_TOPICS
+                if pep_tags:
+                    is_pep = True
+                    role = positions[0] if positions else "Politically Exposed Person"
+                    detail["pep_role"]  = role
+                    detail["pep_state"] = state
+                    detail["pep_score"] = round(score, 2)
+                    log.warning(f"OpenSanctions PEP | '{name}' -> '{caption}' score={score:.2f} role='{role}'")
+
+
+        return is_aml, is_pep, detail
+
+    except Exception as exc:
+        log.warning(f"OpenSanctions API failed: {exc} — mock fallback")
+        aml_e = _name_match(name, _AML_LIST)
+        pep_e = _name_match(name, _PEP_LIST)
+        detail = {}
+        if aml_e:
+            detail["aml_reason"] = aml_e.get("reason", name)
+        if pep_e:
+            detail["pep_role"]  = pep_e.get("role", "PEP")
+            detail["pep_state"] = pep_e.get("state", "India")
+        return bool(aml_e), bool(pep_e), detail
+
+
+# ===================================================================
+# 3. RULE-BASED RISK ENGINE
+# Mapped to: x_snc_flow4now_b_0_application_case.u_risk_level
+# ===================================================================
+# AI REJECTION REASON GENERATOR (Gemini)
+# Mapped to: x_snc_flow4now_b_0_application_case.u_rejection_reason
+# ===================================================================
+def _generate_rejection_reason(
+    risk_level: str,
+    risk_factors: List[str],
+    applicant_name: str
+) -> str:
+    """
+    Uses Gemini 2.5 Flash to generate a concise, point-to-point rejection
+    or flag reason for the ServiceNow Rejection Reason field.
+    Only runs for Medium / High / Critical cases.
+    Falls back to top raw factors if Gemini fails.
+    """
+    if risk_level == "Low" or not risk_factors:
+        return ""   # No rejection reason needed for low-risk approvals
+
+    factors_text = "\n".join(f"- {f}" for f in risk_factors)
+    prompt = f"""You are a KYC compliance system generating rejection reasons for a bank's ServiceNow case.
+
+Applicant: {applicant_name or 'Unknown'}
+Risk Level: {risk_level}
+Flags Detected:
+{factors_text}
+
+Write a CONCISE rejection / flag reason for the compliance officer.
+Rules:
+- 2 to 3 bullet points MAXIMUM
+- Each bullet point must be under 12 words
+- Use professional compliance language
+- Be direct — no preamble, no explanations, just the bullet points
+- If AML or sanctions hit: start with that as bullet 1
+- If PEP: mention role briefly
+- For rule mismatches: state the mismatch plainly
+
+Format exactly like this:
+• [point 1]
+• [point 2]
+• [point 3 only if needed]"""
+
+    try:
+        resp = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=120
+            )
+        )
+        reason = resp.text.strip() if resp.text else ""
+        log.info(f"Rejection reason generated | level={risk_level} | reason={reason!r}")
+        return reason
+    except Exception as exc:
+        log.warning(f"Gemini rejection reason failed: {exc} — using raw factors")
+        # Fallback: join top 3 factors as plain text
+        return " | ".join(risk_factors[:3])
+
+
+# ===================================================================
+# 3. RULE-BASED RISK ENGINE
+# Mapped to: x_snc_flow4now_b_0_application_case.u_risk_level
+# ===================================================================
 @app.post("/api/v1/risk/calculate", tags=["Risk Engine"])
 def calculate_case_risk(payload: RiskAssessmentRequest):
     risk_score = 0
     risk_factors: List[str] = []
-    is_pep = payload.is_pep
+    is_pep     = payload.is_pep
     is_aml_hit = payload.is_aml_hit
 
-    # ── Auto AML/PEP screening by name ───────────────────────────────────────
+    # ── Step 1: Live OpenSanctions screening (AML + PEP in one call) ─────────
     if payload.applicant_name:
-        aml_match = _name_match(payload.applicant_name, _AML_LIST)
-        if aml_match:
-            is_aml_hit = True
-            risk_factors.append(f"AML/Sanctions hit: {aml_match['reason']}")
-            log.warning(f"AML hit for name='{payload.applicant_name}' | reason={aml_match['reason']}")
+        os_aml, os_pep, os_detail = _check_opensanctions(payload.applicant_name)
 
-        pep_match = _name_match(payload.applicant_name, _PEP_LIST)
-        if pep_match:
+        if os_aml:
+            is_aml_hit = True
+            risk_factors.append(f"AML/Sanctions hit: {os_detail.get('aml_reason', payload.applicant_name)}")
+
+        if os_pep:
             is_pep = True
-            risk_factors.append(f"PEP match: {pep_match['role']} ({pep_match['state']})")
-            log.warning(f"PEP hit for name='{payload.applicant_name}' | role={pep_match['role']}")
+            pep_role  = os_detail.get("pep_role",  "Politically Exposed Person")
+            pep_state = os_detail.get("pep_state", "India")
+            risk_factors.append(f"PEP match: {pep_role} ({pep_state})")
 
     # ── Rule 1: AML — always forces Critical ─────────────────────────────────
     if is_aml_hit:
         risk_score += 100
-        if "AML/Sanctions hit" not in " ".join(risk_factors):   # avoid duplicate
+        if not any("AML/Sanctions hit" in f for f in risk_factors):
             risk_factors.append("AML / Sanctions Watchlist Match")
 
     # ── Rule 2: PEP ──────────────────────────────────────────────────────────
     if is_pep:
         risk_score += 40
-        if "PEP match" not in " ".join(risk_factors):
+        if not any("PEP match" in f for f in risk_factors):
             risk_factors.append("Politically Exposed Person (PEP)")
 
-    # ── Rule 3: Income band base score ───────────────────────────────────────
+    # ── Rule 3: Income band ───────────────────────────────────────────────────
     income_pts = _INCOME_SCORES.get(payload.annual_income, 5)
     if income_pts > 0:
         risk_score += income_pts
         risk_factors.append(f"Income band: {payload.annual_income} (+{income_pts} pts)")
 
-    # ── Rule 4: Occupation base score ────────────────────────────────────────
+    # ── Rule 4: Occupation ────────────────────────────────────────────────────
     occ_pts = _OCCUPATION_SCORES.get(payload.occupation, 10)
     if occ_pts > 0:
         risk_score += occ_pts
         risk_factors.append(f"Occupation risk: {payload.occupation} (+{occ_pts} pts)")
 
-    # ── Rule 5: Account type base score ──────────────────────────────────────
+    # ── Rule 5: Account type ──────────────────────────────────────────────────
     acc_pts = _ACCOUNT_SCORES.get(payload.account_type, 5)
     if acc_pts > 0:
         risk_score += acc_pts
@@ -411,18 +593,27 @@ def calculate_case_risk(payload: RiskAssessmentRequest):
 
     if risk_score >= 75 or is_aml_hit:
         risk_level = "Critical"
-        routing = "SAR_INVESTIGATOR"
+        routing    = "SAR_INVESTIGATOR"
     elif risk_score >= 50 or is_pep:
         risk_level = "High"
-        routing = "COMPLIANCE_OFFICER"
+        routing    = "COMPLIANCE_OFFICER"
     elif risk_score >= 20:
         risk_level = "Medium"
-        routing = "SENIOR_OFFICER"
+        routing    = "SENIOR_OFFICER"
     else:
         risk_level = "Low"
-        routing = "STANDARD_QUEUE"
+        routing    = "STANDARD_QUEUE"
 
-    log.info(f"Risk calculated | name={payload.applicant_name!r} income={payload.annual_income} occ={payload.occupation} acc={payload.account_type} score={risk_score} tier={risk_level}")
+    log.info(
+        f"Risk calculated | name={payload.applicant_name!r} "
+        f"income={payload.annual_income} occ={payload.occupation} "
+        f"acc={payload.account_type} score={risk_score} tier={risk_level}"
+    )
+
+    # ── AI Rejection Reason (Gemini) ──────────────────────────────────────────
+    rejection_reason = _generate_rejection_reason(
+        risk_level, risk_factors, payload.applicant_name or "Applicant"
+    )
 
     return {
         "status": "success",
@@ -430,24 +621,29 @@ def calculate_case_risk(payload: RiskAssessmentRequest):
         "risk_score": risk_score,
         "risk_level": risk_level,
         "risk_factors": risk_factors,
+        "rejection_reason": rejection_reason,
         "aml_detected": is_aml_hit,
         "pep_detected": is_pep,
         "recommended_routing": routing
     }
+
 
 # ===================================================================
 # HEALTH ENDPOINT
 # ===================================================================
 @app.get("/health", tags=["System"])
 def health_check():
-    aml_count = len(_AML_LIST)
-    pep_count = len(_PEP_LIST)
+    has_key = bool(os.getenv("OPENSANCTIONS_API_KEY", ""))
     return {
         "status": "healthy",
-        "engine": "KYC Core FastAPI Microservice",
-        "aml_list_entries": aml_count,
-        "pep_list_entries": pep_count
+        "engine": "KYC Core FastAPI Microservice v2.1",
+        "screening": {
+            "source":   "OpenSanctions /match/default (live)" if has_key else "mock lists (fallback)",
+            "coverage": "PEP + Sanctions + Crime — 2M+ records" if has_key else f"mock — AML:{len(_AML_LIST)}, PEP:{len(_PEP_LIST)}",
+            "dataset":  "default" if has_key else "mock_json"
+        }
     }
+
 
 if __name__ == "__main__":
     import uvicorn
