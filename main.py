@@ -458,7 +458,7 @@ def _check_opensanctions(name: str):
 # 3. RULE-BASED RISK ENGINE
 # Mapped to: x_snc_flow4now_b_0_application_case.u_risk_level
 # ===================================================================
-# AI REJECTION REASON GENERATOR (Gemini)
+# REJECTION REASON BUILDER
 # Mapped to: x_snc_flow4now_b_0_application_case.u_rejection_reason
 # ===================================================================
 def _generate_rejection_reason(
@@ -467,53 +467,14 @@ def _generate_rejection_reason(
     applicant_name: str
 ) -> str:
     """
-    Uses Gemini 2.5 Flash to generate a concise, point-to-point rejection
-    or flag reason for the ServiceNow Rejection Reason field.
-    Only runs for Medium / High / Critical cases.
-    Falls back to top raw factors if Gemini fails.
+    Builds rejection reason directly from risk_factors list.
+    No AI call — fast, no truncation, prints exactly what was detected.
+    Returns empty string for Low risk (no rejection needed).
     """
     if risk_level == "Low" or not risk_factors:
-        return ""   # No rejection reason needed for low-risk approvals
+        return ""
 
-    factors_text = "\n".join(f"- {f}" for f in risk_factors)
-    prompt = f"""You are a KYC compliance system generating rejection reasons for a bank's ServiceNow case.
-
-Applicant: {applicant_name or 'Unknown'}
-Risk Level: {risk_level}
-Flags Detected:
-{factors_text}
-
-Write a CONCISE rejection / flag reason for the compliance officer.
-Rules:
-- 2 to 3 bullet points MAXIMUM
-- Each bullet point must be under 12 words
-- Use professional compliance language
-- Be direct — no preamble, no explanations, just the bullet points
-- If AML or sanctions hit: start with that as bullet 1
-- If PEP: mention role briefly
-- For rule mismatches: state the mismatch plainly
-
-Format exactly like this:
-• [point 1]
-• [point 2]
-• [point 3 only if needed]"""
-
-    try:
-        resp = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=120
-            )
-        )
-        reason = resp.text.strip() if resp.text else ""
-        log.info(f"Rejection reason generated | level={risk_level} | reason={reason!r}")
-        return reason
-    except Exception as exc:
-        log.warning(f"Gemini rejection reason failed: {exc} — using raw factors")
-        # Fallback: join top 3 factors as plain text
-        return " | ".join(risk_factors[:3])
+    return " | ".join(risk_factors)
 
 
 # ===================================================================
